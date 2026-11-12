@@ -91,16 +91,18 @@ const CONFIG = {
   campaigns: ["Ưu đãi ra mắt", "Ưu đãi gần Tết"],
 
   /* ---------- NƠI LƯU DỮ LIỆU ----------
-     useFirebase: false → lưu trên trình duyệt của từng máy (bản demo, mỗi người một dữ liệu riêng).
-     useFirebase: true  → cả team dùng CHUNG một bộ dữ liệu theo thời gian thực (xem hướng dẫn README.md). */
-  useFirebase: false,
+     useFirebase: true  → cả team dùng CHUNG một bộ dữ liệu, đồng bộ tức thì giữa mọi máy (project Firebase "gsstudio-quanly").
+                          Ai muốn vào phải đăng nhập Google bằng email đã được cấp quyền (Cài đặt → Truy cập dữ liệu chung).
+     useFirebase: false → bản thử: lưu riêng trên trình duyệt từng máy, KHÔNG đồng bộ.
+     Ghi chú: firebaseConfig là thông tin nhận diện công khai, không phải mật khẩu. Dữ liệu được bảo vệ bằng luật bảo mật trên Firebase. */
+  useFirebase: true,
   firebaseConfig: {
-    apiKey: "",
-    authDomain: "",
-    projectId: "",
-    storageBucket: "",
-    messagingSenderId: "",
-    appId: ""
+    apiKey: "AIzaSyDOtNOHsnHGmoCaRrsY-FXxfuf4K92pXY4",
+    authDomain: "gsstudio-quanly.firebaseapp.com",
+    projectId: "gsstudio-quanly",
+    storageBucket: "gsstudio-quanly.firebasestorage.app",
+    messagingSenderId: "439032126441",
+    appId: "1:439032126441:web:a17da14efe22ea82a2c978"
   }
 };
 </script>
@@ -335,6 +337,8 @@ table.tbl{width:100%;border-collapse:collapse;font-size:14px}
 .report li{margin:3px 0}
 .searchres .li{cursor:pointer}
 .print-only{display:none}
+#sync .pill{padding:6px 10px}
+@media (max-width:520px){#sync .pill{font-size:0;gap:0;padding:8px}#sync .pill i{width:9px;height:9px}}
 
 /* In báo cáo: nền trắng, ẩn điều hướng */
 @media print{
@@ -510,6 +514,8 @@ const LocalAdapter = {
     catch (e) { throw new Error("Trình duyệt đang chặn bộ nhớ (chế độ ẩn danh?). Dữ liệu sẽ không được lưu."); }
   },
   needsAuth() { return false; },
+  email() { return ""; },
+  async checkAccess() { return true; },
   async getAll(c) {
     try { return JSON.parse(localStorage.getItem(this.key(c)) || "[]"); }
     catch (e) { console.warn(e); return []; }
@@ -536,38 +542,91 @@ const LocalAdapter = {
   }
 };
 
+/* Thông báo lỗi Firebase dễ hiểu */
+function fbMsg(e) {
+  const c = (e && e.code) || "";
+  const M = {
+    "permission-denied": "Tài khoản Google này chưa được cấp quyền dùng dữ liệu",
+    "unavailable": "Đang mất mạng – dữ liệu sẽ tự đồng bộ khi có mạng lại",
+    "auth/popup-closed-by-user": "Bạn đã đóng cửa sổ đăng nhập",
+    "auth/cancelled-popup-request": "Cửa sổ đăng nhập đã bị huỷ",
+    "auth/unauthorized-domain": "Tên miền này chưa được cho phép đăng nhập trong Firebase",
+    "auth/network-request-failed": "Lỗi mạng, thử lại sau",
+    "auth/user-disabled": "Tài khoản này đã bị khoá"
+  };
+  return M[c] || (e && e.message) || String(e);
+}
+
 const FirebaseAdapter = {
   name: "Firebase",
-  db: null, auth: null,
+  db: null, auth: null, _unsubs: [],
   async init() {
     const v = "10.12.2", base = `https://www.gstatic.com/firebasejs/${v}/`;
     for (const f of ["firebase-app-compat.js", "firebase-auth-compat.js", "firebase-firestore-compat.js"]) await loadScript(base + f);
     if (!CONFIG.firebaseConfig.apiKey) throw new Error("Chưa điền firebaseConfig trong CONFIG.");
     firebase.initializeApp(CONFIG.firebaseConfig);
     this.auth = firebase.auth();
+    this.auth.languageCode = "vi";
     this.db = firebase.firestore();
-    try { await this.db.enablePersistence({ synchronizeTabs: true }); } catch (e) { /* trình duyệt không hỗ trợ offline – bỏ qua */ }
+    // Lưu bản sao dữ liệu trên máy → mở được khi mất mạng, thao tác offline sẽ tự đồng bộ khi có mạng
+    try { await this.db.enablePersistence({ synchronizeTabs: true }); } catch (e) { /* trình duyệt không hỗ trợ – vẫn chạy online */ }
+    try { await this.auth.getRedirectResult(); } catch (e) { setTimeout(() => toast("Đăng nhập Google lỗi: " + fbMsg(e), "err"), 300); }
     await new Promise((res) => { const off = this.auth.onAuthStateChanged(() => { off(); res(); }); });
   },
   needsAuth() { return !this.auth.currentUser; },
-  async signIn(email, pw) { await this.auth.signInWithEmailAndPassword(email, pw); },
-  async signOut() { await this.auth.signOut(); },
+  email() { return ((this.auth && this.auth.currentUser && this.auth.currentUser.email) || "").toLowerCase(); },
+  async signIn() {
+    const p = new firebase.auth.GoogleAuthProvider();
+    p.setCustomParameters({ prompt: "select_account" });
+    try { await this.auth.signInWithPopup(p); }
+    catch (e) {
+      // Trình duyệt chặn cửa sổ bật lên (hay gặp khi mở app từ màn hình chính điện thoại) → chuyển trang để đăng nhập
+      if (["auth/popup-blocked", "auth/operation-not-supported-in-this-environment", "auth/web-storage-unsupported"].includes(e.code)) return this.auth.signInWithRedirect(p);
+      throw e;
+    }
+  },
+  async signOut() { this._unsubs.forEach((f) => f()); this._unsubs = []; await this.auth.signOut(); },
+  async checkAccess() {
+    try { await this.db.collection("settings").limit(1).get(); return true; }
+    catch (e) { if (e.code === "permission-denied") return false; throw e; }
+  },
+  /* Ghi dữ liệu: Firestore lưu vào máy ngay rồi đẩy lên mây. Không chờ quá 1,5 giây để app không bị "treo" khi mạng yếu/mất mạng;
+     lỗi đến muộn (vd. bị từ chối quyền) vẫn được báo. */
+  _w(p) {
+    return new Promise((res, rej) => {
+      let late = false;
+      const t = setTimeout(() => { late = true; res(); p.catch((e) => toast("Chưa lưu được lên máy chủ: " + fbMsg(e), "err")); }, 1500);
+      p.then(() => { if (!late) { clearTimeout(t); res(); } }, (e) => { if (!late) { clearTimeout(t); rej(e); } });
+    });
+  },
   async getAll(c) { const s = await this.db.collection(c).get(); return s.docs.map((d) => d.data()); },
-  async save(c, obj) { await this.db.collection(c).doc(obj.id).set(clone(obj)); },
+  save(c, obj) { return this._w(this.db.collection(c).doc(obj.id).set(clone(obj))); },
   async saveMany(c, list) {
     for (let i = 0; i < list.length; i += 400) {
       const batch = this.db.batch();
       list.slice(i, i + 400).forEach((o) => batch.set(this.db.collection(c).doc(o.id), clone(o)));
-      await batch.commit();
+      await this._w(batch.commit());
     }
   },
-  async delete(c, id) { await this.db.collection(c).doc(id).delete(); },
+  delete(c, id) { return this._w(this.db.collection(c).doc(id).delete()); },
   async replaceAll(c, list) {
     const cur = await this.getAll(c);
-    for (const o of cur) if (!list.find((x) => x.id === o.id)) await this.delete(c, o.id);
+    for (let i = 0; i < cur.length; i += 400) {
+      const batch = this.db.batch();
+      cur.slice(i, i + 400).filter((o) => !list.find((x) => x.id === o.id)).forEach((o) => batch.delete(this.db.collection(c).doc(o.id)));
+      await this._w(batch.commit());
+    }
     await this.saveMany(c, list);
   },
-  subscribe(cb) { COLS.forEach((c) => this.db.collection(c).onSnapshot((s) => cb(c, s.docs.map((d) => d.data())), (e) => toast("Mất kết nối dữ liệu: " + e.message, "err"))); }
+  subscribe(cb) {
+    this._unsubs.forEach((f) => f());
+    this._unsubs = COLS.map((c) => this.db.collection(c).onSnapshot({ includeMetadataChanges: true },
+      (s) => cb(c, s.docs.map((d) => d.data()), s.metadata),
+      (e) => toast("Mất kết nối dữ liệu: " + fbMsg(e), "err")));
+  },
+  // Danh sách email Google được phép (chỉ chủ project Firebase sửa được – xem luật bảo mật)
+  async getAccess() { const d = await this.db.collection("access").doc("members").get(); return d.exists ? (d.data().emails || []) : []; },
+  async setAccess(emails) { await this.db.collection("access").doc("members").set({ emails, updatedAt: new Date().toISOString(), updatedBy: this.email() }); }
 };
 function loadScript(src) {
   return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("Không tải được " + src)); document.head.appendChild(s); });
@@ -696,7 +755,7 @@ function autoTasksFor(b) {
       if (changed) out.push(ex);
       return;
     }
-    out.push({ id: uid(), key, type, title, assignee, bookingId: b.id, due, status: "todo", auto: true, createdAt: new Date().toISOString() });
+    out.push({ id: "auto_" + key.replace(/[^A-Za-z0-9_-]/g, "_"), key, type, title, assignee, bookingId: b.id, due, status: "todo", auto: true, createdAt: new Date().toISOString() });
   };
   const doneIf = (key, cond) => { const ex = existing(key); if (ex && cond && ex.status !== "done") { ex.status = "done"; ex.doneAt = new Date().toISOString(); out.push(ex); } };
   if (b.status === "huy" || !isClosed(b) || !b.date) return out;
@@ -858,6 +917,19 @@ const NAV = [
 const MORE_IDS = ["sources", "finance", "report", "settings"];
 const navAllowed = () => (isViewer() ? NAV.filter((n) => ["dashboard", "report"].includes(n.id)) : NAV);
 
+/* ---------- Trạng thái đồng bộ ---------- */
+const SYNC = { pending: {}, ready: false };
+let PENDING_RENDER = false;
+function syncPill() {
+  if (!CONFIG.useFirebase) return "";
+  if (!navigator.onLine) return `<span class="pill" style="color:#B0753A;background:#FCF3E4" title="Thao tác vẫn được lưu trên máy và tự đồng bộ khi có mạng"><i></i>Ngoại tuyến</span>`;
+  if (Object.values(SYNC.pending).some(Boolean)) return `<span class="pill" style="color:#B0753A;background:#FCF3E4"><i></i>Đang đồng bộ…</span>`;
+  return `<span class="pill" style="color:var(--ok);background:#EDF6F0" title="Dữ liệu đã lưu lên máy chủ"><i></i>Đã đồng bộ</span>`;
+}
+function paintSync() { ["#sync", "#sync2"].forEach((q) => { const el = $(q); if (el) el.innerHTML = syncPill(); }); }
+window.addEventListener("online", paintSync);
+window.addEventListener("offline", paintSync);
+
 function render() {
   if (!ME) return renderLogin();
   if (!navAllowed().some((n) => n.id === UI.view)) UI.view = "dashboard";
@@ -872,12 +944,13 @@ function render() {
       ${navAllowed().map((n) => `<button class="nav ${UI.view === n.id ? "on" : ""}" data-act="go" data-v="${n.id}">${ic(n.icon)}${n.label}</button>`).join("")}
       <div class="who"><div class="row">${av(ME.id)}<div class="grow"><div style="font-weight:700">${esc(ME.name)}</div><div class="tiny muted">${roleName(ME.role)}</div></div>
         <button class="icon-btn" data-act="logout" title="Đăng xuất">${ic("logout")}</button></div>
-        <div class="tiny muted" style="margin-top:8px">Lưu: ${CONFIG.useFirebase ? "Firebase (dùng chung)" : "trình duyệt máy này"}</div></div>
+        <div class="tiny muted" style="margin-top:8px">${CONFIG.useFirebase ? `Dữ liệu chung · ${esc(store.email())}` : "Lưu: trình duyệt máy này"}</div></div>
     </aside>
     <main class="main">
       <div class="topbar">
         <div class="brand">${logoImg()}<span>${esc(CONFIG.brand)}</span></div>
         <button class="btn grow" style="justify-content:flex-start;color:var(--muted);font-weight:500" data-act="search">${ic("search")}<span class="ellipsis">Tìm khách, SĐT, mã booking…</span></button>
+        <span id="sync">${syncPill()}</span>
         <button class="icon-btn" data-act="notifs" aria-label="Nhắc việc">${ic("bell")}${al.length ? `<span class="dot">${al.length > 99 ? "99+" : al.length}</span>` : ""}</button>
       </div>
       <div id="view">${views[UI.view]()}</div>
@@ -901,7 +974,7 @@ function openModal(html, cls = "") {
   $("#modal-root").innerHTML = `<div class="ov" data-act="ovClose"><div class="sheet ${cls}" role="dialog" aria-modal="true">${html}</div></div>`;
   document.body.style.overflow = "hidden";
 }
-function closeModal() { $("#modal-root").innerHTML = ""; document.body.style.overflow = ""; FORM = null; }
+function closeModal() { $("#modal-root").innerHTML = ""; document.body.style.overflow = ""; FORM = null; if (PENDING_RENDER && ME) { PENDING_RENDER = false; rerender(); } }
 const mHead = (title, extra = "") => `<div class="sheet-h"><h2 class="ellipsis">${title}</h2>${extra}<button class="icon-btn" data-act="close" aria-label="Đóng">${ic("x")}</button></div>`;
 function confirmBox(msg, okLabel = "Đồng ý", danger = false) {
   return new Promise((res) => {
@@ -1587,11 +1660,38 @@ function vReport() {
 /* ================================================================
    8) CÀI ĐẶT
    ================================================================ */
+/* Danh sách email được phép (đọc từ Firebase khi mở Cài đặt) */
+let ACCESS = null, ACCESS_LOADING = false;
+function accessCard() {
+  if (ACCESS === null && !ACCESS_LOADING) {
+    ACCESS_LOADING = true;
+    store.getAccess().then((l) => { ACCESS = l; }).catch(() => { ACCESS = []; }).finally(() => { ACCESS_LOADING = false; if (UI.view === "settings" && !$("#modal-root").innerHTML) rerender(); });
+  }
+  const pend = Object.values(SYNC.pending).some(Boolean);
+  return `<div class="card" style="margin-top:12px"><div class="card-h"><h3>Truy cập dữ liệu chung</h3><span id="sync2">${syncPill()}</span></div>
+    <div class="row wrap between"><span class="small">Đang đăng nhập Google: <b>${esc(store.email())}</b></span><button class="btn btn-sm" data-act="gLogout">${ic("logout")}Đổi tài khoản Google</button></div>
+    ${isMgr() ? `<div class="field" style="margin-top:12px"><label for="acc-emails">Email Google được phép dùng app (mỗi dòng một email)</label>
+      <textarea class="input" id="acc-emails" style="min-height:130px" placeholder="vd: thanhvien@gmail.com">${ACCESS === null ? "" : esc(ACCESS.join("\n"))}</textarea>
+      <span class="hint">${ACCESS === null ? "Đang tải…" : `${ACCESS.length} email. Người tạo project Firebase luôn có quyền và là người duy nhất lưu được danh sách này. Gỡ email ra là người đó mất quyền ngay.`}</span></div>
+      <button class="btn btn-sm btn-primary" style="margin-top:8px" data-act="accSave">${ic("check")}Lưu danh sách</button>` : `<p class="tiny muted" style="margin:10px 0 0">Muốn thêm người dùng mới, nhờ Quản lý vào mục này.</p>`}
+  </div>`;
+}
+/* Dữ liệu còn nằm riêng trên trình duyệt (từ bản thử) – để đưa lên dữ liệu chung */
+function localData() {
+  const get = (c) => { try { return JSON.parse(localStorage.getItem("gsql_v1_" + c) || "[]"); } catch (e) { return []; } };
+  let migrated = null; try { migrated = localStorage.getItem("gsql_migrated"); } catch (e) {}
+  if (migrated) return { bookings: [], tasks: [], expenses: [], settings: null };
+  const bookings = get("bookings").filter((b) => !b.sample);
+  const ids = new Set(bookings.map((b) => b.id));
+  return { bookings, tasks: get("tasks").filter((t) => !(t.bookingId || "").startsWith("sample-") && (!t.bookingId || ids.has(t.bookingId))), expenses: get("expenses").filter((e) => !e.sample), settings: get("settings").find((x) => x.id === "config") || null };
+}
 function vSettings() {
   const P = cfg("pricing"), M = isMgr();
   const dis = M ? "" : "disabled";
   return `<div class="page-h"><div><h1>Cài đặt</h1><p class="muted small">${M ? "Thay đổi được lưu cùng dữ liệu và áp dụng cho cả team" : "Chỉ Quản lý mới sửa được cài đặt chung"}</p></div></div>
   <div class="alert warn" style="cursor:default">${ic("alert")}<span>Dữ liệu khách có thông tin cá nhân (tên, SĐT). ${CONFIG.useFirebase ? "Đang lưu trên Firebase – chỉ tài khoản đã đăng nhập mới đọc/ghi được." : "<b>Bản đang lưu trên trình duyệt máy này</b> – không dùng làm nơi lưu chính khi làm việc nhóm; hãy bật Firebase và sao lưu JSON thường xuyên."}</span></div>
+
+  ${CONFIG.useFirebase ? accessCard() : ""}
 
   <div class="card" style="margin-top:12px"><div class="card-h"><h3>Tài khoản của bạn</h3></div>
     <div class="row">${av(ME.id, "av-lg")}<div class="grow"><b>${esc(ME.name)}</b><div class="tiny muted">${roleName(ME.role)}</div></div><button class="btn btn-sm" data-act="pinSet" data-id="${ME.id}">Đổi PIN</button><button class="btn btn-sm" data-act="logout">${ic("logout")}Đăng xuất</button></div></div>
@@ -1626,8 +1726,10 @@ function vSettings() {
       <button class="btn btn-sm" data-act="csvBookings">${ic("dl")}Xuất CSV booking (mở bằng Excel)</button>
       <button class="btn btn-sm" data-act="icsAll">${ic("ics")}Xuất toàn bộ lịch .ics</button>
     </div>
-    ${M ? `<div class="row wrap" style="margin-top:10px"><button class="btn btn-sm" data-act="seed">Tạo dữ liệu mẫu</button><button class="btn btn-sm btn-danger" data-act="unseed">Xoá dữ liệu mẫu (${DB.bookings.filter((b) => b.sample).length} booking)</button></div>` : ""}
-    <p class="tiny muted" style="margin:12px 0 0">Chế độ lưu chọn trong CONFIG ở đầu file index.html: <code>useFirebase: ${CONFIG.useFirebase}</code>. Hướng dẫn bật Firebase có trong README.md.</p>
+    ${M && !CONFIG.useFirebase ? `<div class="row wrap" style="margin-top:10px"><button class="btn btn-sm" data-act="seed">Tạo dữ liệu mẫu</button><button class="btn btn-sm btn-danger" data-act="unseed">Xoá dữ liệu mẫu (${DB.bookings.filter((b) => b.sample).length} booking)</button></div>` : ""}
+    ${M && CONFIG.useFirebase && DB.bookings.some((b) => b.sample) ? `<div class="row wrap" style="margin-top:10px"><button class="btn btn-sm btn-danger" data-act="unseed">Xoá dữ liệu mẫu (${DB.bookings.filter((b) => b.sample).length} booking)</button></div>` : ""}
+    ${M && CONFIG.useFirebase && localData().bookings.length ? `<div class="banner" style="margin-top:12px"><span>Máy này còn <b>${localData().bookings.length} booking</b> nhập từ bản thử (chưa đồng bộ).</span><button class="btn btn-sm btn-primary" data-act="migrateLocal">${ic("ul")}Đưa lên dữ liệu chung</button></div>` : ""}
+    <p class="tiny muted" style="margin:12px 0 0">${CONFIG.useFirebase ? "Dữ liệu lưu trên Firebase (máy chủ Singapore), đồng bộ tức thì giữa các máy. Nên xuất JSON sao lưu mỗi tuần." : "Bản thử lưu trên trình duyệt máy này. Bật Firebase để cả team dùng chung (xem README.md)."}</p>
   </div>
   <p class="tiny muted" style="text-align:center;margin-top:16px">GS.studio · Quản lý nội bộ</p>`;
 }
@@ -1700,18 +1802,36 @@ async function unseed() {
    ĐĂNG NHẬP
    ================================================================ */
 let LOGIN_SEL = "";
+const LOGIN_HEAD = () => `<div style="text-align:center;margin-bottom:22px"><div style="width:72px;height:72px;margin:0 auto 10px">${logoImg().replace("<img", '<img style="width:72px;height:72px;border-radius:20px"')}</div><h1>GS.studio</h1><p class="muted" style="margin:6px 0 0">Quản lý nội bộ</p></div>`;
+const G_ICON = `<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.6 5.4 2.7 13.3l7.9 6.1C12.5 13.6 17.8 9.5 24 9.5z"/><path fill="#4285F4" d="M46.1 24.6c0-1.6-.1-3.1-.4-4.6H24v9h12.4c-.5 2.9-2.2 5.3-4.6 7l7.2 5.6c4.2-3.9 7.1-9.6 7.1-17z"/><path fill="#FBBC05" d="M10.6 28.6A14.6 14.6 0 0 1 9.5 24c0-1.6.3-3.1.8-4.6l-7.9-6.1A24 24 0 0 0 0 24c0 3.9.9 7.5 2.7 10.7l7.9-6.1z"/><path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.2-5.6c-2 1.4-4.6 2.2-8.7 2.2-6.2 0-11.5-4.1-13.4-9.8l-7.9 6.1C6.6 42.6 14.6 48 24 48z"/></svg>`;
+/* Bước 1 (chỉ khi dùng dữ liệu chung): đăng nhập Google – mỗi máy làm 1 lần */
+function renderGate() {
+  $("#app").innerHTML = `<div class="login"><div class="box">${LOGIN_HEAD()}
+    <div class="card stack"><h3>Đăng nhập để dùng dữ liệu chung</h3>
+      <p class="small muted" style="margin:0">Dùng tài khoản Google đã được Quản lý cấp quyền. Mỗi máy (điện thoại, laptop) chỉ cần đăng nhập 1 lần, sau đó chỉ nhập PIN.</p>
+      <button class="btn btn-block" style="background:#fff" data-act="gLogin">${G_ICON}Đăng nhập bằng Google</button></div>
+    <p class="tiny muted" style="text-align:center;margin-top:14px">Chưa có quyền? Gửi email Google của bạn cho Quản lý để được thêm vào danh sách.</p>
+  </div></div>`;
+}
+function renderDenied() {
+  const em = store.email();
+  $("#app").innerHTML = `<div class="login"><div class="box">${LOGIN_HEAD()}
+    <div class="card stack"><div class="alert bad" style="cursor:default">${ic("alert")}<span>Tài khoản <b>${esc(em)}</b> chưa được cấp quyền xem dữ liệu GS.studio.</span></div>
+      <p class="small" style="margin:0">Gửi email này cho Quản lý (Vân Lam) để được thêm vào <b>Cài đặt → Truy cập dữ liệu chung</b>, rồi bấm “Thử lại”.</p>
+      <div class="row wrap"><button class="btn btn-sm" data-act="copyEmail">${ic("copy")}Sao chép email</button><button class="btn btn-sm" data-act="retryAccess">Thử lại</button><button class="btn btn-sm" data-act="gLogout">${ic("logout")}Dùng tài khoản khác</button></div></div>
+  </div></div>`;
+}
+/* Bước 2: chọn tên + PIN */
 function renderLogin() {
-  const fb = CONFIG.useFirebase && store.needsAuth && store.needsAuth();
   $("#app").innerHTML = `<div class="login"><div class="box">
-    <div style="text-align:center;margin-bottom:22px"><div style="width:72px;height:72px;margin:0 auto 10px">${logoImg().replace("<img", '<img style="width:72px;height:72px;border-radius:20px"')}</div><h1>GS.studio</h1><p class="muted" style="margin:6px 0 0">Quản lý nội bộ</p></div>
-    ${fb ? `<div class="card stack"><h3>Đăng nhập dữ liệu chung</h3><p class="small muted" style="margin:0">Chỉ cần làm 1 lần trên mỗi máy. Dùng email/mật khẩu Quản lý đã tạo trong Firebase.</p>
-      <input class="input" id="fb-email" type="email" placeholder="Email" autocomplete="username"><input class="input" id="fb-pw" type="password" placeholder="Mật khẩu" autocomplete="current-password">
-      <button class="btn btn-primary btn-block" data-act="fbLogin">Đăng nhập</button></div>` : `
+    ${LOGIN_HEAD()}
+    ${`
     <div class="card stack"><div class="lbl">Bạn là ai?</div>
       ${team().map((p) => `<button class="who-btn ${LOGIN_SEL === p.id ? "sel" : ""}" data-act="pickUser" data-id="${p.id}">${av(p.id, "av-lg")}<div class="grow"><div style="font-weight:700">${esc(p.name)}</div><div class="tiny muted">${roleName(p.role)}</div></div></button>`).join("")}
       <div class="${LOGIN_SEL ? "" : "hide"}"><label class="lbl" for="pin">Mã PIN (4–6 số)</label><input class="input pin" id="pin" type="password" inputmode="numeric" maxlength="6" autocomplete="one-time-code" style="margin-top:6px"><button class="btn btn-primary btn-block" style="margin-top:10px" data-act="doLogin">Vào làm việc</button></div>
     </div>`}
     <p class="tiny muted" style="text-align:center;margin-top:14px">Quên PIN? Nhờ Quản lý đặt lại trong Cài đặt.</p>
+    ${CONFIG.useFirebase ? `<p class="tiny muted" style="text-align:center;margin-top:4px">Google: ${esc(store.email())} · <a href="#" data-act="gLogout">đổi tài khoản</a></p>` : ""}
   </div></div>`;
   if (LOGIN_SEL) setTimeout(() => $("#pin")?.focus(), 30);
 }
@@ -1734,7 +1854,32 @@ const ACT = {
   logout: () => { ME = null; LOGIN_SEL = ""; try { localStorage.removeItem("gsql_session"); } catch (e) {} closeModal(); render(); },
   pickUser: (el) => { LOGIN_SEL = el.dataset.id; renderLogin(); },
   doLogin,
-  fbLogin: async () => { try { await store.signIn($("#fb-email").value.trim(), $("#fb-pw").value); await loadAll(); store.subscribe(onRemote); render(); } catch (e) { toast("Đăng nhập Firebase lỗi: " + e.message, "err"); } },
+  gLogin: async (el) => {
+    el.disabled = true;
+    try { await store.signIn(); if (!store.needsAuth()) await afterAuth(); }
+    catch (e) { toast("Đăng nhập Google lỗi: " + fbMsg(e), "err"); }
+    el.disabled = false;
+  },
+  gLogout: async () => { try { localStorage.removeItem("gsql_session"); } catch (e) {} ME = null; try { await store.signOut(); } catch (e) {} location.reload(); },
+  copyEmail: () => copyText(store.email(), "Đã sao chép email"),
+  retryAccess: () => afterAuth(),
+  accSave: async () => {
+    const raw = ($("#acc-emails")?.value || "").split(/[\s,;]+/).map((x) => x.trim().toLowerCase()).filter(Boolean);
+    const bad = raw.filter((x) => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(x));
+    if (bad.length) return toast("Email không hợp lệ: " + bad[0], "err");
+    const list = uniq(raw);
+    if (list.length > 50) return toast("Tối đa 50 email", "err");
+    try { await store.setAccess(list); ACCESS = list; toast(`Đã lưu ${list.length} email được phép`); rerender(); }
+    catch (e) { toast(e.code === "permission-denied" ? "Chỉ chủ project Firebase (người tạo) mới sửa được danh sách này" : fbMsg(e), "err"); }
+  },
+  migrateLocal: async () => {
+    const L = localData();
+    if (!(await confirmBox(`Đưa <b>${L.bookings.length} booking, ${L.tasks.length} việc, ${L.expenses.length} chi phí</b> đang lưu riêng trên máy này lên dữ liệu chung? Booking trùng mã sẽ được ghi đè bằng bản trên máy này.`, "Đưa lên"))) return;
+    await persistMany("bookings", L.bookings); await persistMany("tasks", L.tasks); await persistMany("expenses", L.expenses);
+    if (L.settings && !DB.settings.some((x) => x.id === "config")) await persistMany("settings", [L.settings]);
+    try { localStorage.setItem("gsql_migrated", new Date().toISOString()); } catch (e) {}
+    toast("Đã đưa dữ liệu lên – mọi máy sẽ thấy ngay"); rerender();
+  },
   moreNav: () => openModal(`${mHead("Thêm")}<div class="sheet-b"><div class="list">${NAV.filter((n) => MORE_IDS.includes(n.id)).map((n) => `<div class="li" data-act="go" data-v="${n.id}">${ic(n.icon)}<span class="t grow">${n.label}</span>${ic("right")}</div>`).join("")}<div class="li" data-act="logout">${ic("logout")}<span class="t grow">Đăng xuất (${esc(ME.name)})</span></div></div></div>`, "sm"),
   close: closeModal,
   ovClose: (el, e) => { if (e.target === el) closeModal(); },
@@ -1912,24 +2057,49 @@ document.addEventListener("focusout", (e) => { const el = e.target; if (el.datas
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && $("#modal-root").innerHTML) closeModal();
   if (e.key === "Enter" && e.target.id === "pin") doLogin();
-  if (e.key === "Enter" && e.target.id === "fb-pw") ACT.fbLogin();
 });
 
 /* ================================================================
    KHỞI ĐỘNG
    ================================================================ */
 async function loadAll() { for (const c of COLS) DB[c] = await store.getAll(c); }
-function onRemote(col, list) {
+const REMOTE_SIG = {};
+function onRemote(col, list, meta) {
+  if (meta) SYNC.pending[col] = !!meta.hasPendingWrites;
+  const sig = JSON.stringify(list);
+  const changed = sig !== REMOTE_SIG[col];
+  REMOTE_SIG[col] = sig;
+  paintSync();
+  if (!changed) return;
   DB[col] = list;
-  if (ME) { ME = person(ME.id) || null; if (!$("#modal-root").innerHTML) rerender(); else if (!FORM) { /* đang mở chi tiết – giữ nguyên */ } }
+  if (!ME) return;
+  ME = person(ME.id) || null;
+  if (!ME) return render();
+  // Không vẽ lại khi đang mở cửa sổ hoặc đang gõ – để sau
+  const a = document.activeElement;
+  if ($("#modal-root").innerHTML || (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && $("#app").contains(a))) { PENDING_RENDER = true; return; }
+  rerender();
 }
+document.addEventListener("focusout", () => setTimeout(() => {
+  const a = document.activeElement;
+  if (PENDING_RENDER && ME && !$("#modal-root").innerHTML && !(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) { PENDING_RENDER = false; rerender(); }
+}, 50));
 (async function boot() {
   $("#app").innerHTML = `<div class="login"><div class="muted">Đang tải dữ liệu…</div></div>`;
   try { await store.init(); }
   catch (e) { $("#app").innerHTML = `<div class="login"><div class="card box"><h2>Không khởi động được</h2><p>${esc(e.message)}</p><p class="small muted">Kiểm tra CONFIG (useFirebase, firebaseConfig) hoặc mạng.</p></div></div>`; return; }
-  if (store.needsAuth()) { renderLogin(); return; }
-  try { await loadAll(); } catch (e) { toast("Lỗi đọc dữ liệu: " + e.message, "err"); }
-  // Lần đầu chạy bản demo: tạo sẵn dữ liệu mẫu
+  await afterAuth();
+})();
+async function afterAuth() {
+  if (store.needsAuth()) return renderGate();
+  if (CONFIG.useFirebase) {
+    $("#app").innerHTML = `<div class="login"><div class="muted">Đang kiểm tra quyền truy cập…</div></div>`;
+    let ok = true;
+    try { ok = await store.checkAccess(); } catch (e) { ok = true; /* mất mạng: dùng dữ liệu đã lưu trên máy */ }
+    if (!ok) return renderDenied();
+  }
+  try { await loadAll(); } catch (e) { toast("Lỗi đọc dữ liệu: " + fbMsg(e), "err"); }
+  // Lần đầu chạy bản thử (không Firebase): tạo sẵn dữ liệu mẫu
   let seeded = null; try { seeded = localStorage.getItem("gsql_seeded"); } catch (e) {}
   if (!CONFIG.useFirebase && !seeded && !DB.bookings.length) { await seed(); try { localStorage.setItem("gsql_seeded", "1"); } catch (e) {} }
   await syncTasks();
@@ -1938,8 +2108,8 @@ function onRemote(col, list) {
   ME = sid ? person(sid) || null : null;
   render();
   // nhắc việc tự cập nhật khi qua ngày
-  setInterval(() => { if (ME && !$("#modal-root").innerHTML) rerender(); }, 5 * 60 * 1000);
-})();
+  if (!window.__tick) window.__tick = setInterval(() => { if (ME && !$("#modal-root").innerHTML) rerender(); }, 5 * 60 * 1000);
+}
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
 </script>
 </body>
